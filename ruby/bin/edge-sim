@@ -1,0 +1,52 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Hardware-free EdgeNode. Generates a synthetic sensor stream, runs the on-device
+# pipeline, and prints the resulting hex frames — pipe them straight into
+# edge-gateway, or use --demo to run both ends in-process.
+#
+#   ruby bin/edge-sim --samples 2000 | ruby bin/edge-gateway
+#   ruby bin/edge-sim --demo --samples 2000
+
+require_relative "../lib/edge_suite"
+
+opts = { samples: 1000, seed: 1234, demo: false }
+args = ARGV.dup
+until args.empty?
+  case (flag = args.shift)
+  when "--samples" then opts[:samples] = args.shift.to_i
+  when "--seed"    then opts[:seed] = args.shift.to_i
+  when "--demo"    then opts[:demo] = true
+  when "--emit-only" then opts[:demo] = false
+  when "-h", "--help"
+    puts "usage: edge-sim [--samples N] [--seed N] [--demo]"
+    exit 0
+  else
+    warn "unknown flag: #{flag}"; exit 1
+  end
+end
+
+sim = EdgeSuite::DeviceSimulator.new(seed: opts[:seed])
+
+unless opts[:demo]
+  sim.run(opts[:samples]) { |hex| puts hex }
+  exit 0
+end
+
+# In-process demo: simulator -> gateway.
+gateway = EdgeSuite::Gateway.new
+sim.run(opts[:samples]) do |hex|
+  gateway.ingest(hex) do |ch, idx, value, score|
+    warn format("! anomaly  ch=%d  idx=%-4d  value=%-6d  z=%+.2f", ch, idx, value, score)
+  end
+end
+
+puts "\n=== Demo summary ==="
+gateway.report.each do |r|
+  puts format(
+    "ch %d: %d frames, %d samples, %d B on wire vs %d B raw (%.1f%% saved), %d anomalies",
+    r[:channel], r[:frames], r[:samples], r[:bytes_on_wire],
+    r[:bytes_uncompressed], r[:bandwidth_saved_pct], r[:anomalies]
+  )
+  puts "        advice: #{r[:recommendation]}"
+end
