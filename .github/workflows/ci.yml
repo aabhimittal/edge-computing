@@ -20,6 +20,7 @@ jobs:
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: ${{ matrix.ruby }}
+          working-directory: ruby
           bundler-cache: true
       - name: Run specs (includes C++/Ruby cross-language wire check)
         run: bundle exec rspec
