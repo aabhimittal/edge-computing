@@ -1,39 +1,74 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# Reads EdgeSuite frames as hex lines from stdin (as an EdgeNode sketch prints
-# them over Serial), feeds them through the Gateway, prints per-anomaly alerts,
-# and emits a per-channel summary on EOF.
+# Ingests EdgeSuite frames from a chosen transport, prints per-anomaly alerts,
+# optionally persists statistics, and emits a per-channel summary on exit.
 #
-#   ruby bin/edge-sim --emit-only | ruby bin/edge-gateway
-#   cat frames.hex | ruby bin/edge-gateway
+#   # default: hex frames on stdin (an EdgeNode over Serial, or edge-sim)
+#   ruby bin/edge-sim | ruby bin/edge-gateway
+#
+#   # a real serial port
+#   ruby bin/edge-gateway --serial /dev/ttyUSB0 --baud 115200
+#
+#   # an MQTT broker (needs the 'mqtt' gem); LoRa/Wi-Fi fleets fan in here
+#   ruby bin/edge-gateway --mqtt broker.local --topic 'edge/+/frames'
+#
+#   # persist snapshots + anomaly log to a directory (survives restarts)
+#   ruby bin/edge-gateway --serial /dev/ttyUSB0 --persist ./stats
 
 require_relative "../lib/edge_suite"
 
-gateway = EdgeSuite::Gateway.new
-
-STDIN.each_line do |line|
-  line = line.strip
-  next if line.empty?
-
-  begin
-    gateway.ingest(line) do |ch, idx, value, score|
-      warn format("! anomaly  ch=%d  idx=%-4d  value=%-6d  z=%+.2f", ch, idx, value, score)
-    end
-  rescue EdgeSuite::DecodeError => e
-    warn "  skip (#{e.message}): #{line[0, 24]}..."
+opts = { snapshot_every: 50 }
+args = ARGV.dup
+until args.empty?
+  case (flag = args.shift)
+  when "--serial"  then opts[:serial] = args.shift
+  when "--baud"    then opts[:baud] = args.shift.to_i
+  when "--mqtt"    then opts[:mqtt] = args.shift
+  when "--topic"   then opts[:topic] = args.shift
+  when "--port"    then opts[:port] = args.shift.to_i
+  when "--persist" then opts[:persist] = args.shift
+  when "--snapshot-every" then opts[:snapshot_every] = args.shift.to_i
+  when "-h", "--help"
+    puts <<~USAGE
+      usage: edge-gateway [source] [--persist DIR] [--snapshot-every N]
+        (default source)          hex frames from stdin
+        --serial DEV [--baud N]   a serial port
+        --mqtt HOST [--port N] [--topic T]   an MQTT broker
+    USAGE
+    exit 0
+  else
+    warn "unknown flag: #{flag}"; exit 1
   end
 end
 
+transport = EdgeSuite::Transport.build(opts)
+store = opts[:persist] ? EdgeSuite::StatsStore.new(dir: opts[:persist]) : nil
+runner = EdgeSuite::GatewayRunner.new(store: store, snapshot_every: opts[:snapshot_every])
+
+# Resume note: report what was already on disk before this run.
+if store && (snap = store.load_snapshot)
+  warn "resuming: previous snapshot from #{snap[:updated_at]}, " \
+       "#{store.anomaly_count} anomalies already logged"
+end
+
+runner.run(transport) do |ch, idx, value, score|
+  warn format("! anomaly  ch=%d  idx=%-4d  value=%-6d  z=%+.2f", ch, idx, value, score)
+end
+
 puts "\n=== Gateway summary ==="
-gateway.report.each do |r|
+runner.gateway.report.each do |r|
   next if r.nil?
 
   puts format(
-    "ch %d: %d frames, %d samples, %d B on wire vs %d B raw " \
-    "(%.1f%% saved), %d anomalies",
+    "ch %d: %d frames, %d samples, %d B on wire vs %d B raw (%.1f%% saved), %d anomalies",
     r[:channel], r[:frames], r[:samples], r[:bytes_on_wire],
     r[:bytes_uncompressed], r[:bandwidth_saved_pct], r[:anomalies]
   )
   puts "        advice: #{r[:recommendation]}"
+end
+
+if store
+  store.close
+  puts "\npersisted to #{store.dir}/ (snapshot.json, anomalies.jsonl)"
 end

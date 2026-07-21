@@ -71,16 +71,54 @@ cd ruby && rspec        # or: bundle exec rspec
 
 1. Copy `arduino/libraries/EdgeSuite` into your Arduino `libraries/` folder.
 2. Open **File → Examples → EdgeSuite → EdgeNode**, flash it.
-3. The node prints hex frames over Serial. Feed them to the gateway:
+3. The node prints hex frames over Serial. Read the port directly:
 
 ```bash
-# read the board's serial output and forward it to the gateway
-cat /dev/ttyUSB0 | ruby -Ilib ruby/bin/edge-gateway
+ruby -Ilib bin/edge-gateway --serial /dev/ttyUSB0 --baud 115200
 ```
 
 The `EdgeNode.ino` sketch reads `A0`, runs anomaly detection + adaptive
 sampling, batches samples, and streams compressed frames — ~40 lines of glue
 over the library.
+
+## Transports
+
+The gateway is decoupled from where frames come from; pick a source with a flag:
+
+```bash
+ruby -Ilib bin/edge-gateway                              # stdin (default)
+ruby -Ilib bin/edge-gateway --serial /dev/ttyUSB0        # a real serial port
+ruby -Ilib bin/edge-gateway --mqtt broker.local --topic 'edge/+/frames'
+```
+
+- **Serial** — dependency-free; opens the tty and sets the baud rate via `stty`.
+- **MQTT** — the fan-in point for wireless fleets. Needs the pure-Ruby `mqtt`
+  gem (`gem install mqtt`); payloads may be raw binary frames or hex.
+
+### LoRa fleets
+
+For long range, flash **EdgeNodeLoRa** instead of EdgeNode — same pipeline, but
+frames go out as raw LoRa packets. A cheap radio running **LoRaGateway** receives
+them and re-emits hex over Serial, so the LoRa case reuses the serial reader:
+
+```
+[EdgeNodeLoRa] --LoRa--> [LoRaGateway board] --USB hex--> edge-gateway --serial
+```
+
+(Both LoRa sketches need the "LoRa" library by Sandeep Mistry and an SX127x radio.)
+
+## Persisting statistics
+
+Add `--persist DIR` to keep history across restarts:
+
+```bash
+ruby -Ilib bin/edge-gateway --serial /dev/ttyUSB0 --persist ./stats
+```
+
+- `stats/snapshot.json` — the latest per-channel report, atomically overwritten
+  every N frames (`--snapshot-every`, default 50).
+- `stats/anomalies.jsonl` — append-only log, one JSON object per anomaly event
+  (`tail -f` friendly). On startup the gateway reports what's already on disk.
 
 ---
 
@@ -110,8 +148,13 @@ arduino/libraries/EdgeSuite/   # C++ library (header-only algorithms + codec)
   src/                         #   EdgeSuite.h, AnomalyDetector.h, AdaptiveSampler.h,
                                #   EdgeCompressor.h, EdgeCodec.h
   examples/EdgeNode/           #   reference sketch tying all three together
+  examples/EdgeNodeLoRa/       #   same pipeline, frames sent over LoRa
+  examples/LoRaGateway/        #   LoRa -> Serial hex bridge
 ruby/                          # gateway gem
   lib/edge_suite/              #   codec, frame, detector, sampler, gateway, simulator
+    transport/                 #   stdin, serial, mqtt frame sources
+    stats_store.rb             #   JSON snapshot + JSONL anomaly log
+    gateway_runner.rb          #   transport -> gateway -> store glue
   bin/                         #   edge-sim, edge-gateway
   spec/                        #   rspec suite + C++/Ruby cross-language check
   benchmark/                   #   compression benchmark

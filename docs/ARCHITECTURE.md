@@ -37,6 +37,28 @@ EdgeSuite is a two-tier system with one shared contract.
   savings, emits retuning recommendations.
 - **`device_simulator.rb`** — generates a synthetic sensor stream and runs the
   real on-device pipeline, emitting the same frames a board would.
+- **`transport/`** — pluggable frame sources (`stdin`, `serial`, `mqtt`), each
+  exposing `each_frame { |frame| ... }`. The gateway never knows or cares which
+  one is in use.
+- **`stats_store.rb`** — durable statistics: an atomic `snapshot.json` and an
+  append-only `anomalies.jsonl`.
+- **`gateway_runner.rb`** — wires a transport to the gateway and (optionally) a
+  store: pull frames, ingest, log anomalies, snapshot every N frames, and skip
+  a corrupt frame rather than aborting the stream.
+
+### Transport topology
+
+```
+directly wired :  [EdgeNode] --USB hex--> Serial ----------┐
+LoRa fleet     :  [EdgeNodeLoRa] --LoRa--> [LoRaGateway] --USB hex--> Serial ─┤
+Wi-Fi / MQTT   :  [nodes] --------------------------> MQTT topic ─────────────┤
+                                                                              ▼
+                                                        Transport.each_frame → GatewayRunner
+```
+
+A LoRa or Wi-Fi bridge simply republishes frames (as hex over Serial, or onto an
+MQTT topic); because every path terminates in the same `each_frame` contract,
+the gateway core is identical regardless of the physical link.
 
 ## Data flow
 
