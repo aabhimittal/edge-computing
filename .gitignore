@@ -1,0 +1,16 @@
+# Ruby
+ruby/Gemfile.lock
+ruby/.bundle/
+ruby/pkg/
+ruby/coverage/
+*.gem
+
+# Build / scratch
+/tmp/
+*.o
+edge_xlang_check
+edge_check
+
+# Editor / OS
+.DS_Store
+*.swp

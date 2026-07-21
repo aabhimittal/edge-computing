@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  ruby:
+    name: Ruby gateway (rspec)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        ruby: ["3.0", "3.2", "3.3"]
+    defaults:
+      run:
+        working-directory: ruby
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          working-directory: ruby
+          bundler-cache: true
+      - name: Run specs (includes C++/Ruby cross-language wire check)
+        run: bundle exec rspec
+
+  firmware:
+    name: Firmware headers (compile check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile EdgeSuite headers with g++ (host, no Arduino core)
+        run: |
+          g++ -std=c++11 -Wall -Wextra \
+            -I arduino/libraries/EdgeSuite/src \
+            ruby/spec/cross_language_check.cpp -o /tmp/edge_check
+          /tmp/edge_check

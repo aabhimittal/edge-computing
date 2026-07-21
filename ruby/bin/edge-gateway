@@ -1,0 +1,39 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Reads EdgeSuite frames as hex lines from stdin (as an EdgeNode sketch prints
+# them over Serial), feeds them through the Gateway, prints per-anomaly alerts,
+# and emits a per-channel summary on EOF.
+#
+#   ruby bin/edge-sim --emit-only | ruby bin/edge-gateway
+#   cat frames.hex | ruby bin/edge-gateway
+
+require_relative "../lib/edge_suite"
+
+gateway = EdgeSuite::Gateway.new
+
+STDIN.each_line do |line|
+  line = line.strip
+  next if line.empty?
+
+  begin
+    gateway.ingest(line) do |ch, idx, value, score|
+      warn format("! anomaly  ch=%d  idx=%-4d  value=%-6d  z=%+.2f", ch, idx, value, score)
+    end
+  rescue EdgeSuite::DecodeError => e
+    warn "  skip (#{e.message}): #{line[0, 24]}..."
+  end
+end
+
+puts "\n=== Gateway summary ==="
+gateway.report.each do |r|
+  next if r.nil?
+
+  puts format(
+    "ch %d: %d frames, %d samples, %d B on wire vs %d B raw " \
+    "(%.1f%% saved), %d anomalies",
+    r[:channel], r[:frames], r[:samples], r[:bytes_on_wire],
+    r[:bytes_uncompressed], r[:bandwidth_saved_pct], r[:anomalies]
+  )
+  puts "        advice: #{r[:recommendation]}"
+end
