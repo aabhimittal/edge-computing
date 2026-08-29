@@ -13,28 +13,49 @@ module EdgeSuite
     # Per-channel rolling state and statistics.
     Channel = Struct.new(
       :id, :detector, :sampler, :frames, :samples,
-      :frame_bytes, :raw_bytes, :anomalies, :last_interval, :last_value
+      :frame_bytes, :raw_bytes, :anomalies, :last_interval, :last_value,
+      :first_seen, :last_seen
     )
 
+    # `max_channels` bounds memory on an open link: channel ids come off the
+    # wire, so a faulty (or hostile) node can mint new ones forever. Past the
+    # cap the least recently heard channel is evicted.
+    #
+    # `clock` is the time source used for liveness; it is injected so tests
+    # (and replays of a recorded capture) can drive it deterministically.
     def initialize(alpha: 0.1, threshold: 3.5, warmup: 20,
-                   min_interval: 50, max_interval: 2000)
+                   min_interval: 50, max_interval: 2000,
+                   max_channels: nil, stale_factor: 3.0, silent_factor: 10.0,
+                   clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) })
+      raise ArgumentError, "max_channels must be > 0" if max_channels && max_channels <= 0
+
       @alpha = alpha
       @threshold = threshold
       @warmup = warmup
       @min_interval = min_interval
       @max_interval = max_interval
+      @max_channels = max_channels
+      @stale_factor = stale_factor
+      @silent_factor = silent_factor
+      @clock = clock
       @channels = {}
+      @evictions = 0
     end
 
-    attr_reader :channels
+    attr_reader :channels, :evictions
 
     # Ingest one frame (hex String, binary String, or byte Array).
     # Returns a report Hash for that frame. `on_anomaly` yields (channel_id,
     # sample_index, value, score) for each anomalous sample if a block is given.
-    def ingest(frame_input)
+    # `at` overrides the arrival timestamp (same units as the configured
+    # clock) so a recorded capture can be replayed with its original timing.
+    def ingest(frame_input, at: nil)
       bytes = normalize(frame_input)
       decoded = Frame.decode(bytes)
       ch = channel_for(decoded.channel)
+      now = at || @clock.call
+      ch.first_seen ||= now
+      ch.last_seen = now
 
       anomaly_hits = []
       decoded.samples.each_with_index do |value, idx|
@@ -83,6 +104,7 @@ module EdgeSuite
         compression_ratio: ratio.round(4),
         bandwidth_saved_pct: ((1.0 - ratio) * 100).round(2),
         anomalies: ch.anomalies,
+        last_seen: ch.last_seen,
         mean: ch.detector.mean.round(3),
         std: ch.detector.std.round(3),
         activity: ch.sampler.activity.round(3),
@@ -91,15 +113,69 @@ module EdgeSuite
       }
     end
 
+    # Liveness view of the fleet. A node that stops transmitting is the failure
+    # mode a bandwidth report cannot show — the numbers simply stop moving, and
+    # a dead sensor looks exactly like a quiet one. Each channel is graded
+    # against the cadence the gateway itself recommended to it, so a node told
+    # to sleep for 2 s is not called late after 200 ms:
+    #
+    #   :ok      heard from within stale_factor  x its expected interval
+    #   :stale   overdue, but plausibly a slow/retrying node
+    #   :silent  past silent_factor x expected — treat as down
+    def health(now: nil)
+      now ||= @clock.call
+      @channels.values.map do |ch|
+        expected = (ch.last_interval || @max_interval) / 1000.0
+        silent_for = ch.last_seen ? now - ch.last_seen : 0.0
+        {
+          channel: ch.id,
+          status: grade(silent_for, expected),
+          silent_for: silent_for.round(3),
+          expected_interval_ms: ch.last_interval,
+          frames: ch.frames,
+          last_value: ch.last_value
+        }
+      end
+    end
+
+    # Just the channels that are not :ok — what an alerting loop wants.
+    def silent_channels(now: nil)
+      health(now: now).reject { |h| h[:status] == :ok }
+    end
+
     private
 
+    def grade(silent_for, expected)
+      return :silent if silent_for > expected * @silent_factor
+      return :stale if silent_for > expected * @stale_factor
+
+      :ok
+    end
+
     def channel_for(id)
-      @channels[id] ||= Channel.new(
+      existing = @channels[id]
+      if existing
+        # Ruby hashes iterate in insertion order, so re-inserting on every
+        # touch makes the key order a plain LRU list — no extra structure.
+        @channels.delete(id)
+        return @channels[id] = existing
+      end
+
+      evict_oldest! if @max_channels && @channels.size >= @max_channels
+      @channels[id] = Channel.new(
         id,
         AnomalyDetector.new(alpha: @alpha, threshold: @threshold, warmup: @warmup),
         AdaptiveSampler.new(min_interval: @min_interval, max_interval: @max_interval),
-        0, 0, 0, 0, 0, @max_interval, 0
+        0, 0, 0, 0, 0, @max_interval, 0, nil, nil
       )
+    end
+
+    def evict_oldest!
+      oldest = @channels.keys.first
+      return if oldest.nil?
+
+      @channels.delete(oldest)
+      @evictions += 1
     end
 
     # Simple closed-loop advice: if a channel is anomaly-heavy, suggest a lower

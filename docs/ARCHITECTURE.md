@@ -26,6 +26,10 @@ EdgeSuite is a two-tier system with one shared contract.
 - **`AdaptiveSampler.h`** — maps signal activity to a sampling interval.
 - **`EdgeCompressor.h`** — serializes a sample batch into a frame, choosing
   compressed or raw body by size.
+- **`SwingingDoor.h`** — drops readings a straight line already predicts, within
+  a hard error bound; runs before the radio does.
+- **`FrameStream.h`** — fixed-capacity reassembler that turns a noisy byte
+  stream back into whole, CRC-valid frames.
 - **`EdgeSuite.h`** — umbrella include.
 
 ### Gateway (`ruby/lib/edge_suite`)
@@ -37,7 +41,9 @@ EdgeSuite is a two-tier system with one shared contract.
   savings, emits retuning recommendations.
 - **`device_simulator.rb`** — generates a synthetic sensor stream and runs the
   real on-device pipeline, emitting the same frames a board would.
-- **`transport/`** — pluggable frame sources (`stdin`, `serial`, `mqtt`), each
+- **`frame_stream.rb` / `swinging_door.rb`** — mirrors of the two above, so the
+  gateway can carve frames out of a raw link and predict what a node will keep.
+- **`transport/`** — pluggable frame sources (`stdin`, `serial`, `mqtt`, `raw`), each
   exposing `each_frame { |frame| ... }`. The gateway never knows or cares which
   one is in use.
 - **`stats_store.rb`** — durable statistics: an atomic `snapshot.json` and an
@@ -51,6 +57,7 @@ EdgeSuite is a two-tier system with one shared contract.
 ```
 directly wired :  [EdgeNode] --USB hex--> Serial ----------┐
 LoRa fleet     :  [EdgeNodeLoRa] --LoRa--> [LoRaGateway] --USB hex--> Serial ─┤
+binary link    :  [node] --binary--> [BinaryBridge / --raw] -> FrameStream ───┤
 Wi-Fi / MQTT   :  [nodes] --------------------------> MQTT topic ─────────────┤
                                                                               ▼
                                                         Transport.each_frame → GatewayRunner

@@ -86,7 +86,83 @@ module EdgeSuite
       Decoded.new(channel, flags, samples)
     end
 
+    # Total byte length of the frame that starts at `pos`, derived from the
+    # frame's own header (and, for a compressed body, a walk over its varint
+    # tokens). The format carries no length prefix, so this is what makes it
+    # self-delimiting — and what lets FrameStream cut frames out of a raw byte
+    # stream that has no message boundaries.
+    #
+    # Raises IncompleteFrame when the buffer merely stops short of the end of
+    # the frame (read more, then retry) and DecodeError when the header itself
+    # is structurally impossible (resync instead). Pass `max_frame` to cap how
+    # far a corrupt header may make the reader look ahead.
+    def self.frame_length(bytes, pos = 0, max_frame: nil)
+      raise IncompleteFrame, "need header" if bytes.length - pos < HEADER_LEN
+      raise DecodeError, "bad magic" unless bytes[pos] == MAGIC0 && bytes[pos + 1] == MAGIC1
+      raise DecodeError, "unsupported version #{bytes[pos + 2]}" unless bytes[pos + 2] == VERSION
+
+      count = bytes[pos + 5] | (bytes[pos + 6] << 8)
+      raise DecodeError, "zero sample count" if count.zero?
+
+      body_len =
+        if bytes[pos + 4].anybits?(FLAG_COMPRESSED)
+          compressed_body_length(bytes, pos + HEADER_LEN, count - 1, max_frame)
+        else
+          (count - 1) * 2
+        end
+
+      total = HEADER_LEN + body_len + 1
+      raise DecodeError, "frame longer than #{max_frame} bytes" if max_frame && total > max_frame
+      raise IncompleteFrame, "need body" if pos + total > bytes.length
+
+      total
+    end
+
     # --- internal encoding helpers (see private_class_method below) ---
+
+    # Walk the compressed token stream far enough to account for `need` deltas
+    # and return the body length in bytes. Never scans past `max_frame`, so a
+    # corrupt header cannot send the reader off into the rest of the buffer.
+    def self.compressed_body_length(bytes, start, need, max_frame)
+      pos = start
+      have = 0
+      limit = max_frame ? start + max_frame : nil
+      while have < need
+        raise DecodeError, "frame longer than #{max_frame} bytes" if limit && pos >= limit
+
+        u, pos = scan_varint(bytes, pos)
+        if u.zero?
+          run, pos = scan_varint(bytes, pos)
+          # A zero-length run advances the cursor without producing samples;
+          # a stream of them would be an unbounded scan, so reject it.
+          raise DecodeError, "zero-length run" if run.zero?
+
+          have += run
+        else
+          have += 1
+        end
+      end
+      pos - start
+    end
+
+    # Like Codec.get_varint, but distinguishes "buffer ends mid-varint"
+    # (IncompleteFrame) from "malformed varint" (DecodeError).
+    def self.scan_varint(bytes, pos)
+      result = 0
+      shift = 0
+      while shift <= 28
+        byte = bytes[pos]
+        raise IncompleteFrame, "truncated varint" if byte.nil?
+
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        return [result, pos] if (byte & 0x80).zero?
+
+        shift += 7
+      end
+      raise DecodeError, "varint longer than 5 bytes"
+    end
+
 
     def self.compress_body(samples)
       body = []
@@ -154,6 +230,7 @@ module EdgeSuite
     end
 
     private_class_method :compress_body, :raw_body, :decompress_deltas,
-                         :raw_deltas, :to_i16
+                         :raw_deltas, :to_i16, :compressed_body_length,
+                         :scan_varint
   end
 end

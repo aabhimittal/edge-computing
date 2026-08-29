@@ -10,6 +10,10 @@
 #   # a real serial port
 #   ruby bin/edge-gateway --serial /dev/ttyUSB0 --baud 115200
 #
+#   # a raw binary stream: no hex, no line boundaries, resynced on the fly
+#   ruby bin/edge-gateway --raw /dev/ttyUSB0
+#   ruby bin/edge-gateway --raw capture.bin
+#
 #   # an MQTT broker (needs the 'mqtt' gem); LoRa/Wi-Fi fleets fan in here
 #   ruby bin/edge-gateway --mqtt broker.local --topic 'edge/+/frames'
 #
@@ -24,6 +28,7 @@ until args.empty?
   case (flag = args.shift)
   when "--serial"  then opts[:serial] = args.shift
   when "--baud"    then opts[:baud] = args.shift.to_i
+  when "--raw"     then opts[:raw] = args.shift
   when "--mqtt"    then opts[:mqtt] = args.shift
   when "--topic"   then opts[:topic] = args.shift
   when "--port"    then opts[:port] = args.shift.to_i
@@ -33,7 +38,8 @@ until args.empty?
     puts <<~USAGE
       usage: edge-gateway [source] [--persist DIR] [--snapshot-every N]
         (default source)          hex frames from stdin
-        --serial DEV [--baud N]   a serial port
+        --serial DEV [--baud N]   a serial port (newline-delimited hex)
+        --raw DEV|FILE            a raw binary stream or capture file
         --mqtt HOST [--port N] [--topic T]   an MQTT broker
     USAGE
     exit 0
@@ -66,6 +72,26 @@ runner.gateway.report.each do |r|
     r[:bytes_uncompressed], r[:bandwidth_saved_pct], r[:anomalies]
   )
   puts "        advice: #{r[:recommendation]}"
+end
+
+# Link quality, when the transport carved frames out of a raw byte stream:
+# dropped bytes and CRC errors are the early warning a bandwidth report cannot
+# give — they climb long before frames stop arriving.
+if transport.respond_to?(:stats)
+  st = transport.stats
+  puts format("\nlink: %d frames, %d B dropped, %d CRC errors, %d resyncs",
+              st[:frames], st[:dropped_bytes], st[:crc_errors], st[:resyncs])
+end
+
+# Nodes that went quiet during the run: a dead sensor and a calm one look
+# identical in the numbers above, and only this tells them apart.
+late = runner.gateway.silent_channels
+unless late.empty?
+  puts "\nliveness:"
+  late.each do |h|
+    puts format("  ch %d: %s (%.1fs since last frame, expected every %d ms)",
+                h[:channel], h[:status], h[:silent_for], h[:expected_interval_ms])
+  end
 end
 
 if store
