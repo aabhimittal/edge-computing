@@ -5,13 +5,15 @@ pairs an allocation-free **Arduino/C++ library** that runs on the sensor node
 with a **Ruby gateway gem** that coordinates a fleet of nodes. Both sides
 implement one wire protocol, verified byte-for-byte in CI.
 
-The suite bundles three composable edge algorithms:
+The suite bundles five composable edge primitives:
 
-| Algorithm | Where it runs | What it buys you |
+| Primitive | Where it runs | What it buys you |
 |-----------|---------------|------------------|
 | **Streaming anomaly detection** | device + gateway | Catch outliers in O(1) memory with an EWMA z-score — no history buffer, no cloud round-trip. |
 | **Adaptive event-driven sampling** | device + gateway | Sample fast when the signal is lively, back off when it's quiet. Less power, less bandwidth, no missed events. |
+| **Bounded-error sample selection** | device → gateway | A swinging door drops redundant readings *before* the radio wakes, with a hard guarantee on reconstruction error. 10–50x fewer points on slow signals. |
 | **Delta + RLE frame compression** | device → gateway | Pack `int16` sample batches into compact, CRC-protected frames. 28–81% smaller on real sensor signals. |
+| **Resynchronising frame reassembly** | device + gateway | Recover whole frames from a raw byte stream — split reads, line noise, bit flips and false magic bytes included. |
 
 Everything runs **without hardware** via a device simulator, so you can try the
 whole pipeline on your laptop in seconds.
@@ -27,11 +29,19 @@ attacks one constraint, and they compound:
   events trigger urgent transmission.
 - The **adaptive sampler** decides *how often to look*, spending energy only
   when the signal is changing.
+- The **swinging door** decides *which readings are worth keeping*, discarding
+  everything a straight line already predicts to within a set error bound.
 - The **compressor** decides *how to pack what's left*, shrinking the bytes
   that do go out.
+- The **frame stream** decides *where a frame begins* on a link that delivers
+  bytes rather than messages, so noise costs bytes instead of whole frames.
 
-An anomaly forces the sampler to its fast rate and flags the frame so the
-gateway can prioritize it — the three are wired together in the reference node.
+An anomaly forces the sampler to its fast rate, bypasses the door, and flags
+the frame so the gateway can prioritize it — they are wired together in the
+reference node (`EdgeNode`, and `FrugalNode` for the door).
+
+Together they attack the same byte from four directions: don't sample it,
+don't keep it, don't send it uncompressed, and don't lose it to line noise.
 
 ---
 
@@ -88,10 +98,17 @@ The gateway is decoupled from where frames come from; pick a source with a flag:
 ```bash
 ruby -Ilib bin/edge-gateway                              # stdin (default)
 ruby -Ilib bin/edge-gateway --serial /dev/ttyUSB0        # a real serial port
+ruby -Ilib bin/edge-gateway --raw /dev/ttyUSB0           # raw binary, no framing
+ruby -Ilib bin/edge-gateway --raw capture.bin            # replay a capture
 ruby -Ilib bin/edge-gateway --mqtt broker.local --topic 'edge/+/frames'
 ```
 
 - **Serial** — dependency-free; opens the tty and sets the baud rate via `stty`.
+- **Raw** — any binary byte stream or capture file. There are no line
+  boundaries to lean on, so every chunk goes through `FrameStream`, which finds
+  frame starts, waits out partial frames, and resynchronises after corruption.
+  Halves the bytes on the wire compared with hex, and reports link quality
+  (dropped bytes, CRC errors, resyncs) at exit.
 - **MQTT** — the fan-in point for wireless fleets. Needs the pure-Ruby `mqtt`
   gem (`gem install mqtt`); payloads may be raw binary frames or hex.
 
@@ -107,6 +124,42 @@ them and re-emits hex over Serial, so the LoRa case reuses the serial reader:
 
 (Both LoRa sketches need the "LoRa" library by Sandeep Mistry and an SX127x radio.)
 
+For a binary link, flash **BinaryBridge** on the bridge board instead: it feeds
+every received byte to `FrameStream` and forwards only whole, CRC-valid frames,
+so noise on the radio side never reaches the host as a bogus frame.
+
+## Sending less in the first place
+
+`SwingingDoor` (device and gateway) keeps only the readings a straight line
+cannot already predict, with a hard bound on the error:
+
+```ruby
+door = EdgeSuite::SwingingDoor.new(deviation: 0.5, max_interval: 60_000)
+series.each { |t, v| archive(door.update(t, v)) }   # nil = nothing worth sending
+archive(door.flush)
+```
+
+Every discarded reading is guaranteed within `deviation` of the signal the
+gateway reconstructs — `SwingingDoor.max_error` measures it, and the suite's
+tests assert the bound holds on random walks, ramps, steps and flat lines.
+`max_interval` is a heartbeat, so a silent signal still checks in and a dead
+node stays distinguishable from a calm one.
+
+## Knowing a node is gone
+
+A dead sensor and a quiet one look identical in a bandwidth report: the numbers
+simply stop moving. The gateway grades each channel against the cadence *it*
+recommended to that channel, so a node told to sleep for 2 s is not called late
+after 200 ms:
+
+```ruby
+gw.health          # => [{channel: 1, status: :ok|:stale|:silent, silent_for: 4.2, ...}]
+gw.silent_channels # just the ones that need attention
+```
+
+`Gateway.new(max_channels: 64)` bounds the state a fleet can create: channel ids
+arrive off the wire, so a faulty node cannot mint them without limit — past the
+cap the least recently heard channel is evicted.
 ## Persisting statistics
 
 Add `--persist DIR` to keep history across restarts:
@@ -139,6 +192,11 @@ Real sensor streams are structured, so they compress well. Incompressible
 full-scale noise is the honest worst case: you pay a small framing overhead and
 the encoder falls back to raw deltas rather than expanding further.
 
+The same benchmark measures the swinging door, which composes with the codec:
+on that random walk, a deviation of 2.0 keeps 392 of 2000 points and takes the
+stream from 2808 B to 528 B on the wire — **5.3x**, with every discarded reading
+provably within 2.0 units of what the gateway reconstructs.
+
 ---
 
 ## Layout
@@ -146,13 +204,18 @@ the encoder falls back to raw deltas rather than expanding further.
 ```
 arduino/libraries/EdgeSuite/   # C++ library (header-only algorithms + codec)
   src/                         #   EdgeSuite.h, AnomalyDetector.h, AdaptiveSampler.h,
-                               #   EdgeCompressor.h, EdgeCodec.h
-  examples/EdgeNode/           #   reference sketch tying all three together
+                               #   EdgeCompressor.h, SwingingDoor.h, FrameStream.h,
+                               #   EdgeCodec.h
+  examples/EdgeNode/           #   reference sketch tying the pipeline together
+  examples/FrugalNode/         #   swinging door: send only what carries information
   examples/EdgeNodeLoRa/       #   same pipeline, frames sent over LoRa
   examples/LoRaGateway/        #   LoRa -> Serial hex bridge
+  examples/BinaryBridge/       #   raw byte stream -> validated frames
 ruby/                          # gateway gem
   lib/edge_suite/              #   codec, frame, detector, sampler, gateway, simulator
-    transport/                 #   stdin, serial, mqtt frame sources
+    frame_stream.rb            #   byte stream -> frames, with resynchronisation
+    swinging_door.rb           #   bounded-error lossy sample selection
+    transport/                 #   stdin, serial, mqtt, raw byte-stream sources
     stats_store.rb             #   JSON snapshot + JSONL anomaly log
     gateway_runner.rb          #   transport -> gateway -> store glue
   bin/                         #   edge-sim, edge-gateway
